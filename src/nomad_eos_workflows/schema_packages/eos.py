@@ -10,7 +10,15 @@ if TYPE_CHECKING:
 from nomad.config import config
 from nomad.datamodel.data import Schema, ArchiveSection
 from nomad.datamodel.metainfo.annotations import ELNAnnotation, ELNComponentEnum
-from nomad.metainfo import MEnum, Quantity, SectionProxy, SubSection, SchemaPackage
+from nomad.metainfo import (
+    MEnum,
+    Quantity,
+    SectionProxy,
+    SubSection,
+    SchemaPackage,
+    Section,
+)
+from nomad.metainfo.data_frames import DataFrameTemplate, ValuesTemplate
 from simulationworkflowschema.general import (
     SimulationWorkflow,
     SimulationWorkflowResults,
@@ -25,13 +33,50 @@ configuration = config.get_plugin_entry_point(
 
 m_package = SchemaPackage()
 
+# TODO - link to taxonomy IRIs
+Energy = ValuesTemplate(
+    name='Energy',
+    type=np.float64,
+    shape=[],
+    unit='J',
+    iri='',
+)
+
+Volume = ValuesTemplate(
+    name='Volume',
+    type=np.float64,
+    shape=[],
+    unit='m ** 3',
+    iri='',
+)
+
+
+BoxDeformation = ValuesTemplate(
+    name='BoxDeformation', type=np.float64, shape=[], unit='', iri='', description=''
+)
+
+# ! These are probably not mandatory, just want to follow the example for now
+EOS = DataFrameTemplate(
+    name='EOS',
+    mandatory_fields=[
+        Energy,
+        Volume,
+        BoxDeformation,
+    ],
+)
+
+BandGap = DataFrameTemplate(
+    name='BandGap',
+    mandatory_fields=[Energy],
+)
+
 
 class EOSFit(ArchiveSection):
     """
     Section containing results of an equation of state fit.
     """
 
-    m_def = Section(validate=False)
+    # m_def = Section(validate=False)
 
     function_name = Quantity(
         type=str,
@@ -97,23 +142,25 @@ class EOSFit(ArchiveSection):
 
 
 class EOSResults(SimulationWorkflowResults):
-    volumes = Quantity(
-        type=np.dtype(np.float64),
-        shape=['*'],
-        unit='m ** 3',
-        description="""
-        Array of volumes per atom for which the energies are evaluated.
-        """,
-    )
+    # volumes = Quantity(
+    #     type=np.dtype(np.float64),
+    #     shape=['*'],
+    #     unit='m ** 3',
+    #     description="""
+    #     Array of volumes per atom for which the energies are evaluated.
+    #     """,
+    # )
 
-    energies = Quantity(
-        type=np.dtype(np.float64),
-        shape=['*'],
-        unit='joule',
-        description="""
-        Array of energies corresponding to each volume.
-        """,
-    )
+    # energies = Quantity(
+    #     type=np.dtype(np.float64),
+    #     shape=['*'],
+    #     unit='joule',
+    #     description="""
+    #     Array of energies corresponding to each volume.
+    #     """,
+    # )
+
+    eos = EOS()
 
     eos_fit = SubSection(sub_section=EOSFit.m_def, repeats=True)
 
@@ -189,22 +236,55 @@ class EOSWorkflow(SimulationWorkflow, PlotSection):
         # collect the energies, volumes, and box deformation values from each task
         for task in self.tasks:
             if not task.outputs:
-                volume = None
-                energy = None
-                box_deformations = None
+                logger.warning('Cannot create EOS workflow. Task has no outputs.')
+                volumes = []
+                energies = []
+                box_deformations = []
+                break
             else:
                 # Extract the volume and energy values from the task outputs
-                task_outputs = task.calculation[0]
-                volume = task_outputs.volume or task_outputs.thermodynamics.volume or calculatie the volume from the box
+                task_outputs = task.calculation[0]  # ? First output section?
                 energy = task_outputs.energy.total.value
+                volume = task_outputs.volume
+                if not volume:
+                    volume = task_outputs.thermodynamics.volume
+                if not volume:
+                    lattice_vectors = task.system[
+                        0
+                    ].atoms.lattice_vectors  # ? First system section?
+                    # calculate the volume from the matrix of box vectors
+                    length_unit = lattice_vectors.units
+                    volume = (
+                        np.linalg.det(lattice_vectors.magnitude) * length_unit**3
+                    )  # ? Correct?
+                    box_deformation = None
                 # box_deformation = get_box_deformation() -- I guess this needs to be stripped from the file name, or is there some more robust way to do this?
-
-        try:
-            self.total_energy_differences = self.extract_total_energy_differences(
-                logger=logger
+            volumes.append(volume)
+            energies.append(energy)
+            box_deformations.append(box_deformation)
+        # check if any of the energies are none
+        if energies:
+            energies = energies if all(e is not None for e in energies) else []
+        if volumes:
+            volumes = volumes if all(v is not None for v in volumes) else []
+        if box_deformations:
+            box_deformations = (
+                box_deformations if all(b is not None for b in box_deformations) else []
             )
-        except Exception:
-            logger.error('Could not set NEBWorkflow.total_energy_differences.')
+
+        if energies:
+            # create and populate the DataFrame
+            self.results.eos = EOS.create()
+            self.results.eos.fields = [Energy.create([*energies])]  # ? Units?
+            # self.results.eos.variables = []
+            if volumes:
+                self.results.eos.variables.append(
+                    Volume.create(*volumes, spanned_dimensions=[0])
+                )
+            if box_deformations:
+                self.results.eos.variables.append(
+                    BoxDeformation.create(*box_deformations, spanned_dimensions=[0])
+                )
 
         # TODO - expecting one input structure...from which calc?
         # Extract system name from input structure (chemical composition of first image)
@@ -220,61 +300,62 @@ class EOSWorkflow(SimulationWorkflow, PlotSection):
         else:
             archive.metadata.entry_name = 'EOS Calculation'
 
-        # ? E-V plot is already defined within the js code I believe, should this be moved to plotly?
-        # Generate NEB energy plot using Plotly Express and store it in self.figures
-        # try:
-        #     if (
-        #         self.total_energy_differences is not None
-        #         and len(self.total_energy_differences) > 0
-        #     ):
-        #         # If energies are stored as pint.Quantity, extract magnitude and unit
-        #         if hasattr(self.total_energy_differences, 'm'):
-        #             magnitudes = self.total_energy_differences.m
-        #             unit = str(self.total_energy_differences.u)
-        #         else:
-        #             magnitudes = self.total_energy_differences
-        #             unit = 'eV'  # Default unit if missing
 
-        #         # Custom unit mapping
-        #         unit_mapping = {
-        #             'electron_volt': 'eV',
-        #             'joule': 'J',
-        #             # Add more mappings as needed
-        #         }
+# ? E-V plot is already defined within the js code I believe, should this be moved to plotly?
+# Generate NEB energy plot using Plotly Express and store it in self.figures
+# try:
+#     if (
+#         self.total_energy_differences is not None
+#         and len(self.total_energy_differences) > 0
+#     ):
+#         # If energies are stored as pint.Quantity, extract magnitude and unit
+#         if hasattr(self.total_energy_differences, 'm'):
+#             magnitudes = self.total_energy_differences.m
+#             unit = str(self.total_energy_differences.u)
+#         else:
+#             magnitudes = self.total_energy_differences
+#             unit = 'eV'  # Default unit if missing
 
-        #         # Use pint to format the unit in a pretty way
-        #         ureg = pint.UnitRegistry(system='short')
-        #         pretty_unit = ureg(unit).units.format_babel()
-        #         pretty_unit = unit_mapping.get(
-        #             pretty_unit, pretty_unit
-        #         )  # Apply custom mapping
+#         # Custom unit mapping
+#         unit_mapping = {
+#             'electron_volt': 'eV',
+#             'joule': 'J',
+#             # Add more mappings as needed
+#         }
 
-        #         logger.info(f'Formatted unit: {pretty_unit}')
+#         # Use pint to format the unit in a pretty way
+#         ureg = pint.UnitRegistry(system='short')
+#         pretty_unit = ureg(unit).units.format_babel()
+#         pretty_unit = unit_mapping.get(
+#             pretty_unit, pretty_unit
+#         )  # Apply custom mapping
 
-        #         # Create positions as 1, 2, 3, ..., based on the number of energy entries
-        #         positions = list(range(1, len(magnitudes) + 1))
+#         logger.info(f'Formatted unit: {pretty_unit}')
 
-        #         # Use Plotly Express to create the plot
-        #         fig = px.scatter(
-        #             x=positions,
-        #             y=magnitudes,
-        #             labels={
-        #                 'x': 'Reaction Coordinates',
-        #                 'y': f'Energy Difference ({pretty_unit})',
-        #             },
-        #         )
-        #         fig.add_scatter(
-        #             x=positions, y=magnitudes, mode='lines', line=dict(shape='linear')
-        #         )
+#         # Create positions as 1, 2, 3, ..., based on the number of energy entries
+#         positions = list(range(1, len(magnitudes) + 1))
 
-        #         fig.update_layout(title='NEB Energy Profile', template='plotly_white')
+#         # Use Plotly Express to create the plot
+#         fig = px.scatter(
+#             x=positions,
+#             y=magnitudes,
+#             labels={
+#                 'x': 'Reaction Coordinates',
+#                 'y': f'Energy Difference ({pretty_unit})',
+#             },
+#         )
+#         fig.add_scatter(
+#             x=positions, y=magnitudes, mode='lines', line=dict(shape='linear')
+#         )
 
-        #         # Convert to NOMAD-compatible PlotlyFigure
-        #         self.figures.append(
-        #             PlotlyFigure(label='NEB Workflow', figure=fig.to_plotly_json())
-        #         )
-        # except Exception as e:
-        #     logger.error(f'Error while generating NEB energy plot: {e}')
+#         fig.update_layout(title='NEB Energy Profile', template='plotly_white')
+
+#         # Convert to NOMAD-compatible PlotlyFigure
+#         self.figures.append(
+#             PlotlyFigure(label='NEB Workflow', figure=fig.to_plotly_json())
+#         )
+# except Exception as e:
+#     logger.error(f'Error while generating NEB energy plot: {e}')
 
 
 m_package.__init_metainfo__()

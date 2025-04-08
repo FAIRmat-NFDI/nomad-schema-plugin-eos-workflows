@@ -11,7 +11,7 @@ class NOMADEOSWorkflowsEntryPoint(SchemaPackageEntryPoint):
         return m_package
 
 
-nomad_neb_workflows_plugin = NOMADEOSWorkflowsEntryPoint(
+nomad_eos_workflows_plugin = NOMADEOSWorkflowsEntryPoint(
     name='NOMADEOSWorkflows',
     description='Schema package plugin for the NOMAD EOS workflows definitions.',
 )
